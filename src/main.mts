@@ -1,0 +1,179 @@
+import type { ContractTag, ITagService } from "atq-types";
+
+const DEPLOYMENT = "QmXa7JQ3ggss8JjrrYYt1J4EdHiaB1RdLhxArr1wEnfBXb";
+const ENDPOINT = `https://gateway.thegraph.com/api/deployments/id/${DEPLOYMENT}`;
+const PAGE_SIZE = 1000;
+const MAX_PAGES = 1000;
+const QUERY_TIMEOUT_MS = 30_000;
+const RUN_TIMEOUT_MS = 600_000;
+
+type Meta = {
+  deployment: string;
+  hasIndexingErrors: boolean;
+  block: { number: number; hash: string };
+};
+type Market = {
+  id: string;
+  index: number;
+  silo: { siloId: string; configAddress: string };
+  otherMarket: { id: string };
+};
+
+function address(value: unknown): value is string {
+  return typeof value === "string" && /^0x[0-9a-f]{40}$/.test(value) &&
+    value !== "0x" + "0".repeat(40);
+}
+
+function checkedMeta(meta: Meta): Meta {
+  if (meta?.deployment !== DEPLOYMENT || meta.hasIndexingErrors !== false ||
+      !Number.isSafeInteger(meta.block?.number) || meta.block.number < 1 ||
+      !/^0x[0-9a-f]{64}$/.test(meta.block?.hash ?? "")) {
+    throw new Error("The Silo V2 source metadata is incomplete or unhealthy.");
+  }
+  return meta;
+}
+
+function sameMeta(meta: Meta, anchor: Meta): void {
+  checkedMeta(meta);
+  if (meta.block.number !== anchor.block.number || meta.block.hash !== anchor.block.hash) {
+    throw new Error("The Silo V2 source snapshot changed.");
+  }
+}
+
+function toTag(market: Market): ContractTag {
+  if (!address(market.id) || !address(market.silo?.configAddress) ||
+      !address(market.otherMarket?.id) || market.otherMarket.id === market.id ||
+      !/^(?:0|[1-9][0-9]{0,77})$/.test(market.silo?.siloId ?? "") ||
+      !Number.isSafeInteger(market.index) || market.index < 0 || market.index > 1) {
+    throw new Error("A Silo V2 market has an invalid configuration identity.");
+  }
+  const vaults = market.index === 0 ? [market.id, market.otherMarket.id] :
+    [market.otherMarket.id, market.id];
+  let name = `Silo V2 #${market.silo.siloId} Configuration`;
+  if ([...name].length > 47) name = [...name].slice(0, 44).join("") + "...";
+  return {
+    "Contract Address": `eip155:43114:${market.silo.configAddress}`,
+    "Public Name Tag": name,
+    "Project Name": "Silo Finance",
+    "UI/Website Link": "https://app.silo.finance/",
+    "Public Note": `Silo Finance V2 configuration contract for silo #${market.silo.siloId}. ` +
+      `Lending vault 0: ${vaults[0]}. Lending vault 1: ${vaults[1]}.`,
+  };
+}
+
+const service: ITagService = {
+  returnTags: async (chainId: string, apiKey: string): Promise<ContractTag[]> => {
+    if (chainId !== "43114") throw new Error(`Unsupported Chain ID: ${chainId}.`);
+    if (typeof apiKey !== "string" || apiKey.trim().length === 0) {
+      throw new Error("A query-service API key must be supplied.");
+    }
+    let requests = 0;
+    const deadline = Date.now() + RUN_TIMEOUT_MS;
+    async function query<T>(request: { query: string; variables?: object }): Promise<T> {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) throw new Error("Silo V2 execution deadline reached.");
+      const waitMs = Math.min(QUERY_TIMEOUT_MS, remaining);
+      const queryDeadline = Date.now() + waitMs;
+      const controller = new AbortController();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        return await Promise.race([
+          (async () => {
+            if (++requests > MAX_PAGES + 2) throw new Error("Silo V2 query limit reached.");
+            if (requests > 1) await new Promise<void>(resolve => setTimeout(resolve, 2000));
+            if (controller.signal.aborted || Date.now() >= queryDeadline) {
+              throw new Error("Silo V2 query deadline reached.");
+            }
+            const response = await fetch(ENDPOINT, {
+              method: "POST",
+              redirect: "error",
+              headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+              body: JSON.stringify(request),
+              signal: controller.signal,
+            });
+            if (!response.ok) throw new Error(`Silo V2 query failed with HTTP ${response.status}.`);
+            const result = await response.json() as { data?: T; errors?: unknown };
+            if (Date.now() >= queryDeadline) throw new Error("Silo V2 query deadline reached.");
+            if (!result.data || (result.errors !== undefined &&
+                (!Array.isArray(result.errors) || result.errors.length > 0))) {
+              throw new Error("The Silo V2 query did not return complete data.");
+            }
+            return result.data;
+          })(),
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(() => {
+              controller.abort();
+              reject(new Error("Silo V2 query deadline reached."));
+            }, waitMs);
+          }),
+        ]);
+      } finally {
+        if (timer !== undefined) clearTimeout(timer);
+        controller.abort();
+      }
+    }
+
+    const anchor = checkedMeta((await query<{ _meta: Meta }>({
+      query: "{_meta{deployment hasIndexingErrors block{number hash}}}",
+    }))._meta);
+    const block = { hash: anchor.block.hash };
+    const tags: ContractTag[] = [];
+    const configurations = new Map<string, ContractTag>();
+    let cursor: string | null = null;
+    let complete = false;
+    for (let page = 0; page < MAX_PAGES; page++) {
+      const continued = cursor !== null;
+      // The first page is unfiltered. Later cursors are actual unique Bytes IDs.
+      const data: { markets: Market[]; _meta: Meta } = await query({
+        query: "query Markets(" + (continued ? "$cursor:Bytes!," : "") + "$block:Block_height!){" +
+          "markets(first:1000,orderBy:id,orderDirection:asc," +
+          (continued ? "where:{id_gt:$cursor}," : "") + "block:$block){" +
+          "id index silo{siloId configAddress} otherMarket{id}}" +
+          " _meta(block:$block){deployment hasIndexingErrors block{number hash}}}",
+        variables: { ...(continued ? { cursor } : {}), block },
+      });
+      sameMeta(data._meta, anchor);
+      if (!Array.isArray(data.markets) || data.markets.length > PAGE_SIZE) {
+        throw new Error("The Silo V2 market page is invalid.");
+      }
+      for (const market of data.markets) {
+        if (!address(market?.id) || (cursor !== null && market.id <= cursor)) {
+          throw new Error("Silo V2 market IDs are repeated or not in cursor order.");
+        }
+        const tag = toTag(market), id = tag["Contract Address"];
+        const previous = configurations.get(id);
+        if (previous && JSON.stringify(previous) !== JSON.stringify(tag)) {
+          throw new Error("Two market rows disagree about a Silo V2 configuration.");
+        }
+        if (!previous) { configurations.set(id, tag); tags.push(tag); }
+        cursor = market.id;
+      }
+      if (data.markets.length < PAGE_SIZE) { complete = true; break; }
+    }
+    // A resource limit throws; it never returns a truncated contract set.
+    if (!complete) throw new Error("Silo V2 market pagination did not finish.");
+    const seal = await query<{ _meta: Meta }>({
+      query: "query Seal($block:Block_height!){_meta(block:$block){deployment hasIndexingErrors block{number hash}}}",
+      variables: { block },
+    });
+    sameMeta(seal._meta, anchor);
+
+    const names = new Map<string, number>();
+    for (const tag of tags) {
+      const name = tag["Public Name Tag"].toLowerCase();
+      names.set(name, (names.get(name) ?? 0) + 1);
+    }
+    // Metadata collisions use the complete source address as the identifier.
+    // This retains every market, without fabricated instance numbers or skips.
+    for (const tag of tags) {
+      if (names.get(tag["Public Name Tag"].toLowerCase()) !== 1) {
+        tag["Public Name Tag"] = "Silo " + tag["Contract Address"].split(":")[2];
+      }
+    }
+    return tags;
+  },
+};
+
+export async function returnTags(chainId: string, apiKey: string): Promise<ContractTag[]> {
+  return service.returnTags(chainId, apiKey);
+}
